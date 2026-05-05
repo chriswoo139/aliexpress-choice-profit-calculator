@@ -1,399 +1,276 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from calculator import (
-    ProductInput,
-    calculate_profit,
-    calculate_suggested_supply_price,
-    dataframe_to_excel_bytes,
-    get_batch_template,
-    normalize_percentage,
-    process_batch_dataframe,
-)
+from config import INPUT_COLUMNS, PRICING_RULES, PRODUCT_TYPES, SCORING_RULES
+from exporter import build_all_outputs, dataframe_to_excel_bytes, workbook_to_excel_bytes
+from listing_generator import build_size_table
+from models import ProductRecord, normalize_dataframe, sample_dataframe
 
 
 st.set_page_config(
-    page_title="AliExpress Choice 全托管利润计算器",
-    page_icon="📈",
+    page_title="速卖通全托管女性内衣选品与报价工具",
+    page_icon="📊",
     layout="wide",
 )
 
 
-DEFAULT_SETTINGS: dict[str, Any] = {
-    "default_category": "女士内衣",
-    "default_currency": "RMB",
-    "default_packaging_cost": 0.0,
-    "default_label_cost": 0.15,
-    "default_domestic_logistics_cost": 0.5,
-    "default_inbound_logistics_cost": 0.8,
-    "default_qc_labor_cost": 0.2,
-    "default_loss_rate": 3.0,
-    "default_return_reserve_rate": 2.0,
-    "default_capital_cost_rate": 1.5,
-    "default_exchange_loss_rate": 1.0,
-    "default_target_margin_rate": 30.0,
-    "cautious_margin_threshold": 20.0,
-    "feasible_margin_threshold": 30.0,
-}
-
-CURRENCY_SYMBOLS = {
-    "RMB": "¥",
-    "USD": "$",
-    "EUR": "€",
-    "GBP": "£",
-}
+def init_state() -> None:
+    if "input_df" not in st.session_state:
+        st.session_state["input_df"] = sample_dataframe()
 
 
-def init_settings() -> None:
-    if "settings" not in st.session_state:
-        st.session_state["settings"] = DEFAULT_SETTINGS.copy()
-
-
-def get_settings() -> dict[str, Any]:
-    return st.session_state["settings"]
-
-
-def format_currency(value: float, currency: str) -> str:
-    symbol = CURRENCY_SYMBOLS.get(currency, "")
-    return f"{symbol}{value:,.2f}"
+def read_uploaded_file(uploaded_file) -> pd.DataFrame:
+    if uploaded_file.name.lower().endswith(".csv"):
+        return pd.read_csv(uploaded_file, encoding="utf-8-sig")
+    return pd.read_excel(uploaded_file)
 
 
 def render_header() -> None:
-    st.title("速卖通 AliExpress Choice 全托管利润计算器")
-    st.caption("面向跨境卖家的中文利润测算工具，快速判断平台供货价是否值得做，并反推合理报价。")
+    st.title("速卖通全托管女性内衣选品与报价工具")
+    st.caption("用于女性内衣、无痕内裤、运动内衣、文胸配件、文胸延长扣、防滑肩带扣等类目的选品评分、供货报价、资料生成与 Excel 导出。")
+    st.info("竞品价格请手动录入或通过 CSV/Excel 导入。本工具不接入违反平台规则的爬虫。", icon="ℹ️")
 
 
-def render_single_product_page() -> None:
-    settings = get_settings()
-    st.subheader("单品测算")
-
-    with st.form("single_product_form"):
-        left_col, right_col = st.columns(2)
-        with left_col:
-            product_name = st.text_input("产品名称", value="女士无痕内裤")
-            sku = st.text_input("SKU", value="NXK-001")
-            category = st.text_input("类目", value=settings["default_category"])
-            currency = st.selectbox("币种", options=list(CURRENCY_SYMBOLS.keys()), index=list(CURRENCY_SYMBOLS.keys()).index(settings["default_currency"]))
-            unit_purchase_cost = st.number_input("单件采购成本", min_value=0.0, value=3.20, step=0.1)
-            units_per_set = st.number_input("每套件数", min_value=1, value=3, step=1)
-            packaging_cost = st.number_input("包装成本", min_value=0.0, value=float(settings["default_packaging_cost"]), step=0.1)
-            label_cost = st.number_input("贴标成本", min_value=0.0, value=float(settings["default_label_cost"]), step=0.05)
-
-        with right_col:
-            domestic_logistics_cost = st.number_input("国内物流摊销", min_value=0.0, value=float(settings["default_domestic_logistics_cost"]), step=0.1)
-            inbound_logistics_cost = st.number_input("入仓物流摊销", min_value=0.0, value=float(settings["default_inbound_logistics_cost"]), step=0.1)
-            qc_labor_cost = st.number_input("质检人工摊销", min_value=0.0, value=float(settings["default_qc_labor_cost"]), step=0.05)
-            supply_price = st.number_input("平台供货价 / 结算价", min_value=0.0, value=15.90, step=0.1)
-            loss_rate = st.number_input("损耗率 %", min_value=0.0, value=float(settings["default_loss_rate"]), step=0.5)
-            return_reserve_rate = st.number_input("退供/滞销预提率 %", min_value=0.0, value=float(settings["default_return_reserve_rate"]), step=0.5)
-            capital_cost_rate = st.number_input("资金成本率 %", min_value=0.0, value=float(settings["default_capital_cost_rate"]), step=0.5)
-            exchange_loss_rate = st.number_input("汇率损耗率 %", min_value=0.0, value=float(settings["default_exchange_loss_rate"]), step=0.5)
-            target_margin_rate = st.number_input("目标毛利率 %", min_value=0.0, max_value=99.0, value=float(settings["default_target_margin_rate"]), step=1.0)
-
-        submitted = st.form_submit_button("开始测算", use_container_width=True)
-
-    if not submitted:
-        st.info("填写参数后点击“开始测算”，即可看到单品利润、毛利率和建议供货价。")
-        return
-
-    product = ProductInput(
-        product_name=product_name,
-        sku=sku,
-        category=category,
-        currency=currency,
-        unit_purchase_cost=unit_purchase_cost,
-        units_per_set=units_per_set,
-        packaging_cost=packaging_cost,
-        label_cost=label_cost,
-        domestic_logistics_cost=domestic_logistics_cost,
-        inbound_logistics_cost=inbound_logistics_cost,
-        qc_labor_cost=qc_labor_cost,
-        supply_price=supply_price,
-        loss_rate=loss_rate,
-        return_reserve_rate=return_reserve_rate,
-        capital_cost_rate=capital_cost_rate,
-        exchange_loss_rate=exchange_loss_rate,
-        target_margin_rate=target_margin_rate,
-        cautious_margin_threshold=float(settings["cautious_margin_threshold"]),
-        feasible_margin_threshold=float(settings["feasible_margin_threshold"]),
-    )
-    result = calculate_profit(product)
-
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("单套净利润", format_currency(result.set_net_profit, currency))
-    metric_cols[1].metric("毛利率", f"{result.gross_margin:.2%}")
-    metric_cols[2].metric("最终总成本", format_currency(result.final_total_cost, currency))
-    metric_cols[3].metric("最低建议供货价", format_currency(result.suggested_supply_price, currency))
-
-    st.success(f"结论：{result.decision}")
-
-    detail_df = pd.DataFrame(
-        [
-            ("单件基础成本", result.unit_base_cost),
-            ("单套基础成本", result.set_base_cost),
-            ("损耗成本", result.loss_cost),
-            ("退供/滞销预提成本", result.return_reserve_cost),
-            ("资金成本", result.capital_cost),
-            ("汇率损耗成本", result.exchange_loss_cost),
-            ("最终总成本", result.final_total_cost),
-            ("单件净利润", result.unit_net_profit),
-            ("单套净利润", result.set_net_profit),
-            ("毛利率", result.gross_margin),
-            ("投入产出比", result.roi),
-            ("建议供货价", result.suggested_supply_price),
-        ],
-        columns=["指标", "结果"],
-    )
-    st.dataframe(
-        detail_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    export_df = pd.DataFrame(
-        [
-            {
-                "产品名称": product_name,
-                "SKU": sku,
-                "最终成本": result.final_total_cost,
-                "供货价": supply_price,
-                "净利润": result.set_net_profit,
-                "毛利率": result.gross_margin,
-                "建议供货价": result.suggested_supply_price,
-                "是否值得做": result.decision,
-            }
-        ]
-    )
-    st.download_button(
-        "导出当前测算结果 Excel",
-        data=dataframe_to_excel_bytes(export_df),
-        file_name=f"{sku or 'single-product'}_利润测算.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-def render_reverse_pricing_page() -> None:
-    settings = get_settings()
-    st.subheader("供货价反推")
-    st.caption("基于最终成本和目标毛利率，反推最低建议供货价。")
-
-    reverse_mode = st.radio(
-        "反推方式",
-        options=["直接输入最终成本", "按成本结构计算最终成本"],
-        horizontal=True,
-    )
-
-    if reverse_mode == "直接输入最终成本":
-        col1, col2 = st.columns(2)
-        with col1:
-            currency = st.selectbox("币种", options=list(CURRENCY_SYMBOLS.keys()), key="reverse_currency")
-            final_total_cost = st.number_input("最终总成本", min_value=0.0, value=10.0, step=0.1, key="reverse_final_cost")
-        with col2:
-            target_margin_rate = st.number_input(
-                "目标毛利率 %",
-                min_value=0.0,
-                max_value=99.0,
-                value=float(settings["default_target_margin_rate"]),
-                step=1.0,
-                key="reverse_target_margin_direct",
-            )
-
-        suggested_price = calculate_suggested_supply_price(final_total_cost, target_margin_rate)
-        st.metric("最低建议供货价", format_currency(suggested_price, currency))
-        st.info(f"计算公式：最低供货价 = {final_total_cost:.2f} / (1 - {normalize_percentage(target_margin_rate):.2%})")
-        return
-
-    with st.form("reverse_cost_breakdown_form"):
-        left_col, right_col = st.columns(2)
-        with left_col:
-            product_name = st.text_input("产品名称", value="文胸延长扣", key="reverse_product_name")
-            sku = st.text_input("SKU", value="YCK-001", key="reverse_sku")
-            currency = st.selectbox("币种", options=list(CURRENCY_SYMBOLS.keys()), key="reverse_currency_cost")
-            unit_purchase_cost = st.number_input("单件采购成本", min_value=0.0, value=0.85, step=0.05, key="reverse_unit_purchase_cost")
-            units_per_set = st.number_input("每套件数", min_value=1, value=2, step=1, key="reverse_units_per_set")
-            packaging_cost = st.number_input("包装成本", min_value=0.0, value=float(settings["default_packaging_cost"]), step=0.1, key="reverse_packaging_cost")
-            label_cost = st.number_input("贴标成本", min_value=0.0, value=float(settings["default_label_cost"]), step=0.05, key="reverse_label_cost")
-        with right_col:
-            domestic_logistics_cost = st.number_input("国内物流摊销", min_value=0.0, value=float(settings["default_domestic_logistics_cost"]), step=0.1, key="reverse_domestic")
-            inbound_logistics_cost = st.number_input("入仓物流摊销", min_value=0.0, value=float(settings["default_inbound_logistics_cost"]), step=0.1, key="reverse_inbound")
-            qc_labor_cost = st.number_input("质检人工摊销", min_value=0.0, value=float(settings["default_qc_labor_cost"]), step=0.05, key="reverse_qc")
-            loss_rate = st.number_input("损耗率 %", min_value=0.0, value=float(settings["default_loss_rate"]), step=0.5, key="reverse_loss_rate")
-            return_reserve_rate = st.number_input("退供/滞销预提率 %", min_value=0.0, value=float(settings["default_return_reserve_rate"]), step=0.5, key="reverse_return_rate")
-            capital_cost_rate = st.number_input("资金成本率 %", min_value=0.0, value=float(settings["default_capital_cost_rate"]), step=0.5, key="reverse_capital_rate")
-            exchange_loss_rate = st.number_input("汇率损耗率 %", min_value=0.0, value=float(settings["default_exchange_loss_rate"]), step=0.5, key="reverse_exchange_rate")
-            target_margin_rate = st.number_input("目标毛利率 %", min_value=0.0, max_value=99.0, value=float(settings["default_target_margin_rate"]), step=1.0, key="reverse_target_margin_cost")
-
-        submitted = st.form_submit_button("反推建议供货价", use_container_width=True)
-
-    if not submitted:
-        st.info("你可以直接输入最终成本，也可以按完整成本结构自动反推供货价。")
-        return
-
-    result = calculate_profit(
-        ProductInput(
-            product_name=product_name,
-            sku=sku,
-            currency=currency,
-            unit_purchase_cost=unit_purchase_cost,
-            units_per_set=units_per_set,
-            packaging_cost=packaging_cost,
-            label_cost=label_cost,
-            domestic_logistics_cost=domestic_logistics_cost,
-            inbound_logistics_cost=inbound_logistics_cost,
-            qc_labor_cost=qc_labor_cost,
-            supply_price=0.0,
-            loss_rate=loss_rate,
-            return_reserve_rate=return_reserve_rate,
-            capital_cost_rate=capital_cost_rate,
-            exchange_loss_rate=exchange_loss_rate,
-            target_margin_rate=target_margin_rate,
-            cautious_margin_threshold=float(settings["cautious_margin_threshold"]),
-            feasible_margin_threshold=float(settings["feasible_margin_threshold"]),
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.header("规则摘要")
+        st.write("评分满分 100 分，A/B/C/D 自动分级。")
+        st.write(
+            f"建议报价目标毛利率：{PRICING_RULES['target_margin_rate']:.0%}；"
+            f"安全报价毛利率：{PRICING_RULES['safe_margin_rate']:.0%}。"
         )
-    )
+        with st.expander("评分权重", expanded=False):
+            for key, value in SCORING_RULES["weights"].items():
+                label = {
+                    "market_demand": "市场需求",
+                    "supply_price_advantage": "供应价优势",
+                    "size_stability": "尺码稳定性",
+                    "differentiation": "差异化卖点",
+                    "logistics_packaging": "物流包装友好度",
+                    "return_risk": "退货风险",
+                    "compliance_risk": "合规风险",
+                }[key]
+                st.write(f"{label}: {value} 分")
 
-    reverse_cols = st.columns(3)
-    reverse_cols[0].metric("最终总成本", format_currency(result.final_total_cost, currency))
-    reverse_cols[1].metric("最低建议供货价", format_currency(result.suggested_supply_price, currency))
-    reverse_cols[2].metric("目标毛利率", f"{normalize_percentage(target_margin_rate):.2%}")
 
-    st.dataframe(
-        pd.DataFrame(
-            [
-                ("单套基础成本", result.set_base_cost),
-                ("损耗成本", result.loss_cost),
-                ("退供/滞销预提成本", result.return_reserve_cost),
-                ("资金成本", result.capital_cost),
-                ("汇率损耗成本", result.exchange_loss_cost),
-                ("最终总成本", result.final_total_cost),
-                ("建议供货价", result.suggested_supply_price),
-            ],
-            columns=["指标", "结果"],
-        ),
+def render_upload_area() -> None:
+    st.subheader("1. 数据录入")
+    col1, col2, col3 = st.columns([1.2, 1, 1])
+    with col1:
+        uploaded_file = st.file_uploader("上传 CSV / Excel", type=["csv", "xlsx", "xls"])
+        if uploaded_file is not None:
+            try:
+                st.session_state["input_df"] = normalize_dataframe(read_uploaded_file(uploaded_file))
+                st.success("文件已导入，可以在下方表格继续编辑。")
+            except Exception as exc:  # pragma: no cover - Streamlit UI guard
+                st.error(f"导入失败：{exc}")
+    with col2:
+        template = pd.DataFrame(columns=INPUT_COLUMNS)
+        st.download_button(
+            "下载空白导入模板",
+            dataframe_to_excel_bytes(template, "导入模板"),
+            file_name="aliexpress_choice_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col3:
+        if st.button("恢复示例数据", use_container_width=True):
+            st.session_state["input_df"] = sample_dataframe()
+            st.rerun()
+
+
+def render_manual_add_form() -> None:
+    with st.expander("手动新增一个产品", expanded=False):
+        with st.form("manual_add_form", clear_on_submit=False):
+            left, middle, right = st.columns(3)
+            with left:
+                product_name = st.text_input("产品名称", value="女士无痕内裤")
+                sku = st.text_input("SKU", value="NEW-001")
+                product_type = st.selectbox("产品类型", PRODUCT_TYPES)
+                purchase_price = st.number_input("采购价 RMB", min_value=0.0, value=3.0, step=0.1)
+                packaging_cost = st.number_input("包装成本 RMB", min_value=0.0, value=0.5, step=0.1)
+                domestic_shipping = st.number_input("国内运费 RMB", min_value=0.0, value=float(PRICING_RULES["domestic_shipping_rmb"]), step=0.1)
+                qc_labor = st.number_input("质检人工 RMB", min_value=0.0, value=float(PRICING_RULES["qc_labor_rmb"]), step=0.05)
+            with middle:
+                loss_rate = st.number_input("损耗率 %", min_value=0.0, value=float(PRICING_RULES["loss_rate"] * 100), step=0.5)
+                capital_rate = st.number_input("资金占用率 %", min_value=0.0, value=float(PRICING_RULES["capital_cost_rate"] * 100), step=0.5)
+                unit_weight = st.number_input("单品重量 g", min_value=0.0, value=30.0, step=1.0)
+                combo_count = st.number_input("组合件数", min_value=1, value=1, step=1)
+                supplier_moq = st.number_input("供应商起订量", min_value=0, value=300, step=50)
+                color_count = st.number_input("颜色数量", min_value=0, value=4, step=1)
+                size_count = st.number_input("尺码数量", min_value=0, value=4, step=1)
+            with right:
+                is_light_small = st.checkbox("是否轻小件", value=True)
+                easy_return = st.checkbox("是否容易退货", value=False)
+                compliance_risk = st.checkbox("是否有合规风险", value=False)
+                competitor_lowest = st.number_input("竞品最低售价", min_value=0.0, value=16.9, step=0.1)
+                competitor_mainstream = st.number_input("竞品主流售价", min_value=0.0, value=22.9, step=0.1)
+                estimated_supply = st.number_input("预估平台供货价", min_value=0.0, value=12.9, step=0.1)
+                differentiation = st.text_area("差异化卖点", value="无痕、亲肤、高弹、多色组合")
+
+            submitted = st.form_submit_button("添加到表格", use_container_width=True)
+            if submitted:
+                record = ProductRecord(
+                    product_name=product_name,
+                    sku=sku,
+                    product_type=product_type,
+                    purchase_price_rmb=purchase_price,
+                    packaging_cost_rmb=packaging_cost,
+                    domestic_shipping_rmb=domestic_shipping,
+                    qc_labor_rmb=qc_labor,
+                    loss_rate=loss_rate / 100,
+                    capital_cost_rate=capital_rate / 100,
+                    unit_weight_g=unit_weight,
+                    combo_count=combo_count,
+                    supplier_moq=supplier_moq,
+                    color_count=color_count,
+                    size_count=size_count,
+                    is_light_small=is_light_small,
+                    easy_return=easy_return,
+                    compliance_risk=compliance_risk,
+                    differentiation=differentiation,
+                    competitor_lowest_price=competitor_lowest,
+                    competitor_mainstream_price=competitor_mainstream,
+                    estimated_supply_price=estimated_supply,
+                )
+                st.session_state["input_df"] = pd.concat(
+                    [st.session_state["input_df"], pd.DataFrame([record.to_input_row()])],
+                    ignore_index=True,
+                )
+                st.success("已添加。")
+
+
+def render_data_editor() -> pd.DataFrame:
+    st.write("可以直接在表格中修改数据，新增行后系统会自动参与评分和报价。")
+    edited_df = st.data_editor(
+        normalize_dataframe(st.session_state["input_df"]),
+        num_rows="dynamic",
         use_container_width=True,
-        hide_index=True,
+        height=380,
+        column_config={
+            "产品类型": st.column_config.SelectboxColumn("产品类型", options=PRODUCT_TYPES, required=True),
+            "是否轻小件": st.column_config.CheckboxColumn("是否轻小件"),
+            "是否容易退货": st.column_config.CheckboxColumn("是否容易退货"),
+            "是否有合规风险": st.column_config.CheckboxColumn("是否有合规风险"),
+            "差异化卖点": st.column_config.TextColumn("差异化卖点", width="large"),
+        },
+        key="input_editor",
     )
+    st.session_state["input_df"] = normalize_dataframe(edited_df)
+    return st.session_state["input_df"]
 
 
-def render_batch_page() -> None:
-    settings = get_settings()
-    st.subheader("批量测算")
-    st.caption("上传 Excel 后自动批量测算利润，并支持结果导出。")
-
-    template_df = get_batch_template()
-    st.download_button(
-        "下载批量导入模板",
-        data=dataframe_to_excel_bytes(template_df, sheet_name="导入模板"),
-        file_name="AliExpress_Choice_批量测算模板.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.markdown(
-        """
-        必填字段：
-        `产品名称`、`SKU`、`采购价`、`件数`、`包装成本`、`物流成本`、`供货价`、`损耗率`、`目标毛利率`
-
-        可选字段：
-        `类目`、`币种`、`贴标成本`、`入仓物流摊销`、`质检人工摊销`、`退供/滞销预提率`、`资金成本率`、`汇率损耗率`
-        """
-    )
-
-    uploaded_file = st.file_uploader("上传批量测算 Excel", type=["xlsx", "xls"])
-    if uploaded_file is None:
-        st.info("先下载模板填数，或直接上传你自己的 SKU 测算表。")
+def render_score_tab(score_df: pd.DataFrame) -> None:
+    st.subheader("2. 选品评分")
+    if score_df.empty:
+        st.warning("请先录入产品数据。")
         return
 
-    raw_df = pd.read_excel(uploaded_file)
-    st.write("上传预览")
-    st.dataframe(raw_df, use_container_width=True, hide_index=True)
+    metrics = st.columns(4)
+    metrics[0].metric("产品数", len(score_df))
+    metrics[1].metric("A级产品", int((score_df["等级"] == "A").sum()))
+    metrics[2].metric("建议报价", int((score_df["是否建议报价"] == "建议报价").sum()))
+    metrics[3].metric("平均得分", f"{score_df['总分'].mean():.1f}")
+    st.dataframe(score_df.sort_values("总分", ascending=False), use_container_width=True, hide_index=True)
 
-    try:
-        result_df = process_batch_dataframe(raw_df, settings)
-    except ValueError as exc:
-        st.error(str(exc))
+
+def render_pricing_tab(quote_df: pd.DataFrame) -> None:
+    st.subheader("3. 利润与报价")
+    if quote_df.empty:
+        st.warning("请先录入产品数据。")
         return
-
-    st.write("测算结果")
-    st.dataframe(result_df, use_container_width=True, hide_index=True)
-
-    feasible_count = int((result_df["是否值得做"] == "可做").sum())
-    cautious_count = int((result_df["是否值得做"] == "谨慎").sum())
-    not_recommended_count = int((result_df["是否值得做"] == "不建议做").sum())
-    summary_cols = st.columns(3)
-    summary_cols[0].metric("可做 SKU", feasible_count)
-    summary_cols[1].metric("谨慎 SKU", cautious_count)
-    summary_cols[2].metric("不建议 SKU", not_recommended_count)
-
-    st.download_button(
-        "导出批量测算结果 Excel",
-        data=dataframe_to_excel_bytes(result_df),
-        file_name="AliExpress_Choice_批量测算结果.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    display_df = quote_df.copy()
+    display_df["毛利率"] = display_df["毛利率"].map(lambda value: f"{value:.2%}")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.caption("单件真实成本 = 采购价 × 组合件数 + 包装成本 + 国内运费 + 质检人工 + 损耗成本 + 资金占用成本。")
 
 
-def render_settings_page() -> None:
-    st.subheader("参数设置")
-    st.caption("这里的默认参数会影响单品测算、供货价反推和批量测算中的默认值。")
-    settings = get_settings().copy()
+def render_listing_tab(listing_df: pd.DataFrame, input_df: pd.DataFrame) -> None:
+    st.subheader("4. 商品资料生成")
+    if listing_df.empty:
+        st.warning("请先录入产品数据。")
+        return
+    st.dataframe(listing_df, use_container_width=True, hide_index=True)
 
-    with st.form("settings_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            settings["default_category"] = st.text_input("默认类目", value=settings["default_category"])
-            settings["default_currency"] = st.selectbox(
-                "默认币种",
-                options=list(CURRENCY_SYMBOLS.keys()),
-                index=list(CURRENCY_SYMBOLS.keys()).index(settings["default_currency"]),
-            )
-            settings["default_packaging_cost"] = st.number_input("默认包装成本", min_value=0.0, value=float(settings["default_packaging_cost"]), step=0.1)
-            settings["default_label_cost"] = st.number_input("默认贴标成本", min_value=0.0, value=float(settings["default_label_cost"]), step=0.05)
-            settings["default_domestic_logistics_cost"] = st.number_input("默认国内物流摊销", min_value=0.0, value=float(settings["default_domestic_logistics_cost"]), step=0.1)
-            settings["default_inbound_logistics_cost"] = st.number_input("默认入仓物流摊销", min_value=0.0, value=float(settings["default_inbound_logistics_cost"]), step=0.1)
+    records = [ProductRecord.from_series(row) for _, row in normalize_dataframe(input_df).iterrows()]
+    if records:
+        selected = st.selectbox("查看尺码表示例", options=[record.sku or record.product_name for record in records])
+        record = next(record for record in records if (record.sku or record.product_name) == selected)
+        st.dataframe(build_size_table(record), use_container_width=True, hide_index=True)
 
-        with col2:
-            settings["default_qc_labor_cost"] = st.number_input("默认质检人工摊销", min_value=0.0, value=float(settings["default_qc_labor_cost"]), step=0.05)
-            settings["default_loss_rate"] = st.number_input("默认损耗率 %", min_value=0.0, value=float(settings["default_loss_rate"]), step=0.5)
-            settings["default_return_reserve_rate"] = st.number_input("默认退供/滞销预提率 %", min_value=0.0, value=float(settings["default_return_reserve_rate"]), step=0.5)
-            settings["default_capital_cost_rate"] = st.number_input("默认资金成本率 %", min_value=0.0, value=float(settings["default_capital_cost_rate"]), step=0.5)
-            settings["default_exchange_loss_rate"] = st.number_input("默认汇率损耗率 %", min_value=0.0, value=float(settings["default_exchange_loss_rate"]), step=0.5)
-            settings["default_target_margin_rate"] = st.number_input("默认目标毛利率 %", min_value=0.0, max_value=99.0, value=float(settings["default_target_margin_rate"]), step=1.0)
 
-        threshold_cols = st.columns(2)
-        with threshold_cols[0]:
-            settings["cautious_margin_threshold"] = st.number_input("“谨慎”下限 %", min_value=0.0, max_value=99.0, value=float(settings["cautious_margin_threshold"]), step=1.0)
-        with threshold_cols[1]:
-            settings["feasible_margin_threshold"] = st.number_input("“可做”下限 %", min_value=0.0, max_value=99.0, value=float(settings["feasible_margin_threshold"]), step=1.0)
+def render_compliance_tab(compliance_df: pd.DataFrame) -> None:
+    st.subheader("5. 合规检查")
+    if compliance_df.empty:
+        st.warning("请先录入产品数据。")
+        return
+    st.dataframe(compliance_df, use_container_width=True, hide_index=True)
+    st.caption("合规检查为运营提醒，不替代平台规则和人工审核。内衣类目请重点复核主图、模特姿势、标题用词、材质、尺码和包装数量。")
 
-        save_settings = st.form_submit_button("保存参数设置", use_container_width=True)
 
-    if save_settings:
-        st.session_state["settings"] = settings
-        st.success("默认参数已更新。")
-
-    st.write("当前默认参数")
-    st.json(st.session_state["settings"])
+def render_export_tab(outputs: dict[str, pd.DataFrame]) -> None:
+    st.subheader("6. Excel 导出")
+    st.write("可分别导出评分、报价、商品资料，也可以导出包含全部工作表的总表。")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.download_button(
+            "导出评分表",
+            dataframe_to_excel_bytes(outputs["选品评分"], "选品评分"),
+            file_name="product_score_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col2:
+        st.download_button(
+            "导出报价表",
+            dataframe_to_excel_bytes(outputs["报价测算"], "报价测算"),
+            file_name="quotation_sheet.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col3:
+        st.download_button(
+            "导出上架资料",
+            dataframe_to_excel_bytes(outputs["商品资料"], "商品资料"),
+            file_name="listing_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col4:
+        st.download_button(
+            "导出总表",
+            workbook_to_excel_bytes(outputs),
+            file_name="aliexpress_choice_full_output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
 
 def main() -> None:
-    init_settings()
+    init_state()
     render_header()
-    page = st.sidebar.radio(
-        "功能导航",
-        options=["单品测算", "批量测算", "供货价反推", "参数设置"],
-    )
+    render_sidebar()
+    render_upload_area()
+    render_manual_add_form()
+    input_df = render_data_editor()
+    outputs = build_all_outputs(input_df)
 
-    if page == "单品测算":
-        render_single_product_page()
-    elif page == "批量测算":
-        render_batch_page()
-    elif page == "供货价反推":
-        render_reverse_pricing_page()
-    else:
-        render_settings_page()
+    score_tab, pricing_tab, listing_tab, compliance_tab, export_tab = st.tabs(
+        ["选品评分", "利润报价", "商品资料", "合规检查", "导出"]
+    )
+    with score_tab:
+        render_score_tab(outputs["选品评分"])
+    with pricing_tab:
+        render_pricing_tab(outputs["报价测算"])
+    with listing_tab:
+        render_listing_tab(outputs["商品资料"], input_df)
+    with compliance_tab:
+        render_compliance_tab(outputs["合规检查"])
+    with export_tab:
+        render_export_tab(outputs)
 
 
 if __name__ == "__main__":
